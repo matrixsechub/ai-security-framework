@@ -1,0 +1,6 @@
+crewai
+pyautogen
+chromadb
+openai
+
+
