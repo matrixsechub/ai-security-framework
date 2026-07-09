@@ -30,7 +30,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Module-level logger (structured JSON via custom formatter)
@@ -67,6 +67,45 @@ def configure_logging(level: int = logging.INFO) -> None:
 # Pipeline Data Models
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Security Plane Bootstrap — §02: Security Lifecycle Stage Definitions
+# Stages 1–3 are implemented in this module; 4–9 are defined for reference.
+# ---------------------------------------------------------------------------
+
+class SecurityLifecycleStage(Enum):
+    """
+    Canonical stage identifiers for the multi-agent OS security lifecycle.
+    Each stage maps to an owning repo (see LIFECYCLE_STAGE_OWNERS).
+    """
+    INTAKE          = "01:INTAKE"           # intake-agent-v2
+    GROUNDING       = "02:GROUNDING"        # ai-security-framework
+    ANALYSIS        = "03:ANALYSIS"         # ai-security-framework
+    # ANALYSIS_READY: Aurelius cleared and registered; enters Stage 03 on activation.
+    # Distinct from ANALYSIS so lifecycle tooling can distinguish "cleared to enter"
+    # from "actively executing" without modifying downstream stage routing.
+    ANALYSIS_READY  = "03:ANALYSIS_READY"   # ai-security-framework (AureliusAgent)
+    EVALUATION      = "04:EVALUATION"       # ai-security-framework
+    THREAT_MODEL    = "05:THREAT_MODEL"     # ai-security-framework (conditional)
+    RED_TEAM        = "06:RED_TEAM"         # ai-security-framework + ttx-operator-shell
+    COMPLIANCE      = "07:COMPLIANCE"       # ai-security-framework → gh0st-lay3r
+    AUDIT           = "08:AUDIT"            # marketplace-tracking-backend
+    HQ_PROPAGATE    = "09:HQ_PROPAGATE"    # gh0st-lay3r
+
+
+LIFECYCLE_STAGE_OWNERS: dict[SecurityLifecycleStage, str] = {
+    SecurityLifecycleStage.INTAKE:          "intake-agent-v2",
+    SecurityLifecycleStage.GROUNDING:       "ai-security-framework",
+    SecurityLifecycleStage.ANALYSIS:        "ai-security-framework",
+    SecurityLifecycleStage.ANALYSIS_READY:  "ai-security-framework",  # AureliusAgent
+    SecurityLifecycleStage.EVALUATION:      "ai-security-framework",
+    SecurityLifecycleStage.THREAT_MODEL:    "ai-security-framework",
+    SecurityLifecycleStage.RED_TEAM:        "ai-security-framework+ttx-operator-shell",
+    SecurityLifecycleStage.COMPLIANCE:      "ai-security-framework→gh0st-lay3r",
+    SecurityLifecycleStage.AUDIT:           "marketplace-tracking-backend",
+    SecurityLifecycleStage.HQ_PROPAGATE:    "gh0st-lay3r",
+}
+
+
 class PipelineStatus(Enum):
     PENDING    = auto()
     RUNNING    = auto()
@@ -91,6 +130,9 @@ class PipelineInput:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     sanitized: bool = False             # Set True after sanitization pass
+    # Security Plane bootstrap additions (§02/§04):
+    force_threat_modeling: bool = False # Set by intake_tm_classifier_fn to bypass analyst escalation check
+    metadata: dict[str, Any] = field(default_factory=dict)  # Arbitrary classification metadata from intake
 
 
 @dataclass
@@ -128,6 +170,8 @@ class PipelineResult:
     audit_log: list[dict[str, Any]] = field(default_factory=list)
     completed_at_utc: Optional[str] = None
     error: Optional[dict[str, Any]] = None
+    # Security Plane bootstrap addition (§02): tracks the last stage reached
+    current_stage: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -789,20 +833,22 @@ def run_pipeline(
     enable_red_team: bool = False,
     auto_approve_human_review: bool = False,
     audit_sink: str = "stdout",
+    # Security Plane bootstrap additions (§04 — Threat Modeling Hooks):
+    intake_tm_classifier_fn: Optional[Callable[[dict[str, Any], str], bool]] = None,
 ) -> PipelineResult:
     """
     Execute the full MatrixSecHub AI-Cybersecurity Pipeline.
 
     Stages:
-      1. Input sanitization
-      2. RAG grounding
-      3. Security Analyst Agent
-      4. Evaluation rubric
-      5. Threat Modeling Agent (conditional)
-      6. Red Team Adversary Agent (conditional + human-in-the-loop)
-      7. Compliance/Governance gate (per agent)
-      8. Audit logging
-      9. Result aggregation
+      1. Input sanitization            [INTAKE        — intake-agent-v2]
+      2. RAG grounding                 [GROUNDING     — ai-security-framework]
+      3. Security Analyst Agent        [ANALYSIS      — ai-security-framework]
+      4. Evaluation rubric             [EVALUATION    — ai-security-framework]
+      5. Threat Modeling Agent (cond.) [THREAT_MODEL  — ai-security-framework]
+      6. Red Team Adversary + HITL     [RED_TEAM      — ai-security-framework + ttx-operator-shell]
+      7. Compliance/Governance gate    [COMPLIANCE    — ai-security-framework → gh0st-lay3r]
+      8. Audit logging                 [AUDIT         — marketplace-tracking-backend]
+      9. Result aggregation            [HQ_PROPAGATE  — gh0st-lay3r]
 
     Args:
         raw_input:                   Raw alert or description dict.
@@ -813,6 +859,9 @@ def run_pipeline(
         enable_red_team:             Enable adversarial simulation stage.
         auto_approve_human_review:   Auto-approve human checkpoints (test only).
         audit_sink:                  Audit log destination identifier.
+        intake_tm_classifier_fn:     Optional callable (raw_input, input_type) → bool.
+                                     When provided (§04 hook), sets force_threat_modeling
+                                     on PipelineInput, bypassing analyst escalation check.
 
     Returns:
         PipelineResult aggregating all outputs and audit trail.
@@ -838,13 +887,33 @@ def run_pipeline(
     )
 
     try:
-        # ── Stage 1: Input Sanitization ────────────────────────────────────
+        # ── Stage 1: Input Sanitization  [INTAKE — intake-agent-v2] ────────
+        result.current_stage = SecurityLifecycleStage.INTAKE.value
         pipeline_input = _sanitize_input(pipeline_input, audit, run_id)
 
-        # ── Stage 2: RAG Grounding ─────────────────────────────────────────
+        # §04 Threat Modeling Hook: run intake classifier before agents see input.
+        # This allows intake-agent-v2 to pre-classify requests as threat model
+        # targets, bypassing the analyst escalation check in Stage 4.
+        if intake_tm_classifier_fn is not None:
+            pipeline_input.force_threat_modeling = intake_tm_classifier_fn(
+                pipeline_input.raw_input,
+                pipeline_input.input_type,
+            )
+            if pipeline_input.force_threat_modeling:
+                audit.log_event(
+                    "TM_HOOK_ACTIVATED",
+                    run_id,
+                    None,
+                    "intake",
+                    {"classifier": intake_tm_classifier_fn.__name__, "force_threat_modeling": True},
+                )
+
+        # ── Stage 2: RAG Grounding  [GROUNDING — ai-security-framework] ────
+        result.current_stage = SecurityLifecycleStage.GROUNDING.value
         rag_context = _ground_input(pipeline_input, rag_pipeline, audit, run_id)
 
-        # ── Stage 3: Security Analyst Agent ────────────────────────────────
+        # ── Stage 3: Security Analyst Agent  [ANALYSIS — ai-security-framework]
+        result.current_stage = SecurityLifecycleStage.ANALYSIS.value
         analyst_output = invoke_security_analyst(pipeline_input, rag_context, llm_client)
         analyst_eval = rubric.evaluate(analyst_output)
         audit.log_event("AGENT_OUTPUT", run_id, "SecurityAnalystAgent", "analyst", {"eval": analyst_eval})
@@ -852,6 +921,7 @@ def run_pipeline(
         if not analyst_eval["passed"]:
             return _fail_pipeline(result, "Security Analyst output failed evaluation rubric.", audit, run_id)
 
+        result.current_stage = SecurityLifecycleStage.EVALUATION.value
         analyst_compliance = invoke_compliance_governance(analyst_output, llm_client)
         result.analyst_output = analyst_output
         result.compliance_output = analyst_compliance
@@ -860,8 +930,13 @@ def run_pipeline(
             return _block_pipeline(result, analyst_compliance, audit, run_id)
 
         # ── Stage 4: Threat Modeling (Conditional) ─────────────────────────
-        escalate = analyst_output.payload.get("escalate_to_threat_modeling", False)
+        # Activated by analyst escalation OR by intake_tm_classifier_fn (§04 hook).
+        escalate = (
+            analyst_output.payload.get("escalate_to_threat_modeling", False)
+            or pipeline_input.force_threat_modeling
+        )
         if escalate:
+            result.current_stage = SecurityLifecycleStage.THREAT_MODEL.value
             rag_context_tm = _ground_input(pipeline_input, rag_pipeline, audit, run_id, stage="threat_modeling")
             tm_output = invoke_threat_modeling(analyst_output, rag_context_tm, llm_client)
             tm_eval = rubric.evaluate(tm_output)
@@ -870,14 +945,16 @@ def run_pipeline(
             if not tm_eval["passed"]:
                 return _fail_pipeline(result, "Threat Modeling output failed evaluation rubric.", audit, run_id)
 
+            result.current_stage = SecurityLifecycleStage.COMPLIANCE.value
             tm_compliance = invoke_compliance_governance(tm_output, llm_client)
             result.threat_model_output = tm_output
 
             if tm_compliance.payload["decision"] == "BLOCKED":
                 return _block_pipeline(result, tm_compliance, audit, run_id)
 
-            # ── Stage 5: Red Team Adversary (Optional) ─────────────────────
+            # ── Stage 6: Red Team Adversary  [RED_TEAM] ────────────────────
             if enable_red_team:
+                result.current_stage = SecurityLifecycleStage.RED_TEAM.value
                 rag_context_rt = _ground_input(pipeline_input, rag_pipeline, audit, run_id, stage="red_team")
                 rt_output = invoke_red_team_adversary(tm_output, rag_context_rt, llm_client)
 
@@ -891,16 +968,18 @@ def run_pipeline(
                 rt_eval = rubric.evaluate(rt_output)
                 audit.log_event("AGENT_OUTPUT", run_id, "RedTeamAdversaryAgent", "red_team", {"eval": rt_eval})
 
+                result.current_stage = SecurityLifecycleStage.COMPLIANCE.value
                 rt_compliance = invoke_compliance_governance(rt_output, llm_client)
                 result.red_team_output = rt_output
 
                 if rt_compliance.payload["decision"] == "BLOCKED":
                     return _block_pipeline(result, rt_compliance, audit, run_id)
 
-        # ── Stage 6: Final Evaluation Summary ─────────────────────────────
+        # ── Stage 7: Final Evaluation Summary  [EVALUATION] ───────────────
         result.evaluation_summary = _build_evaluation_summary(result, rubric)
 
-        # ── Stage 7: Pipeline Complete ─────────────────────────────────────
+        # ── Stage 8–9: Complete  [AUDIT / HQ_PROPAGATE — later branches] ──
+        result.current_stage = SecurityLifecycleStage.AUDIT.value
         result.status = PipelineStatus.COMPLETED
         result.completed_at_utc = datetime.now(timezone.utc).isoformat()
         result.audit_log = audit.get_full_audit_trail()

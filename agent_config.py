@@ -51,6 +51,7 @@ class ToolCategory(Enum):
     POLICY_GATE      = "policy_gate"         # Approve / block pipeline messages
     SIMULATION_EXEC  = "simulation_exec"     # Adversarial simulation (sandboxed)
     ALERT_DISPATCH   = "alert_dispatch"      # Dispatch alerts to ticketing/SIEM
+    SAFE_TELEMETRY_LOG = "safe_telemetry_log"  # Aurelius: write audit-safe telemetry events
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +256,44 @@ COMPLIANCE_GOVERNANCE_AGENT = AgentConfig(
 
 
 # ---------------------------------------------------------------------------
+# Aurelius Agent — Security Analysis Orchestrator (reactivated under §§01–04)
+# ---------------------------------------------------------------------------
+#
+# Trust level : MEDIUM  — standard operational access, no veto or delegation rights
+# Permissions : read:public (SIEM), read:analysis (RAG, CVE), write:analysis (reports)
+# Namespace   : session:analysis (rw), session:investigation (r), kb:cve (r)
+# TM escalation: disabled — Aurelius inputs are single-stage alerts; the classifier
+#                will not trigger unless force_threat_modeling is set externally.
+# Lifecycle   : SecurityLifecycleStage.ANALYSIS_READY (03:ANALYSIS_READY)
+
+AURELIUS_AGENT = AgentConfig(
+    name="AureliusAgent",
+    role="Security Analysis Orchestrator",
+    trust_level=TrustLevel.MEDIUM,
+    allowed_tools=[
+        ToolCategory.SIEM_READ,           # read:public — live telemetry ingestion
+        ToolCategory.RAG_RETRIEVAL,       # read:analysis — knowledge base queries
+        ToolCategory.CVE_LOOKUP,          # read:analysis — vulnerability context
+        ToolCategory.REPORT_WRITE,        # write:analysis — structured findings
+        ToolCategory.SAFE_TELEMETRY_LOG,  # cross-repo: safeTelemetryLog + linkage
+    ],
+    memory_scope=["session:analysis", "session:investigation", "kb:cve"],
+    max_iterations=6,
+    output_schema="aurelius_analysis_v1",
+    safety_guardrails=[
+        "no_pii_in_output",
+        "structured_output_only",
+        "citation_required",
+        "no_external_url_generation",
+        "max_token_budget",
+    ],
+    requires_review=False,
+    temperature=0.15,
+    model=os.getenv("AURELIUS_MODEL", "gpt-4o"),
+)
+
+
+# ---------------------------------------------------------------------------
 # Agent Registry
 # ---------------------------------------------------------------------------
 
@@ -263,6 +302,7 @@ AGENT_REGISTRY: dict[str, AgentConfig] = {
     "threat_modeling":      THREAT_MODELING_AGENT,
     "red_team_adversary":   RED_TEAM_ADVERSARY_AGENT,
     "compliance_governance": COMPLIANCE_GOVERNANCE_AGENT,
+    "aurelius":             AURELIUS_AGENT,
 }
 
 
@@ -365,3 +405,235 @@ def _derive_system_message(config: AgentConfig) -> str:
         f"Active safety guardrails:\n{guardrail_list}\n\n"
         f"Produce all outputs in '{config.output_schema}' format. "
         f"Do not exceed {config.max_iterations} reasoning steps per task."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Security Plane Bootstrap — §03: Agent Permissioning Model
+# Integration Plan ref: memory namespace isolation + cross-repo tool permissions
+# ---------------------------------------------------------------------------
+
+# Maps every memory namespace to its owning repo, permitted readers/writers,
+# and any special constraints (append_only, isolated).
+MEMORY_NAMESPACE_MAP: dict[str, dict[str, Any]] = {
+    # session:analysis — owned by ai-security-framework; Aurelius writes enriched
+    # findings here; intake-agent-v2 sends pre-classified alerts as the source agent.
+    # append_only: analysis findings accumulate within a run and are never overwritten.
+    "session:analysis": {
+        "owner_repo": "ai-security-framework",
+        "read_agents": ["AureliusAgent", "intake_agent_v2", "ComplianceGovernanceAgent"],
+        "write_agents": ["AureliusAgent"],
+        "append_only": True,
+    },
+    "session:investigation": {
+        "owner_repo": "intake-agent-v2",
+        "read_agents": ["SecurityAnalystAgent", "AureliusAgent", "ComplianceGovernanceAgent"],
+        "write_agents": ["SecurityAnalystAgent"],
+    },
+    "session:threat_model": {
+        "owner_repo": "ai-security-framework",
+        "read_agents": ["ThreatModelingAgent", "ComplianceGovernanceAgent"],
+        "write_agents": ["ThreatModelingAgent"],
+    },
+    "session:redteam_sandbox": {
+        "owner_repo": "ai-security-framework",
+        # RedTeamAdversaryAgent is isolated: it cannot read investigation or
+        # compliance outputs, preventing it from tailoring attacks to known defenses.
+        "read_agents": ["RedTeamAdversaryAgent", "ComplianceGovernanceAgent"],
+        "write_agents": ["RedTeamAdversaryAgent"],
+        "isolated": True,
+    },
+    "kb:cve": {
+        "owner_repo": "shared",
+        "read_agents": ["SecurityAnalystAgent", "ThreatModelingAgent", "ComplianceGovernanceAgent"],
+        "write_agents": [],
+    },
+    "kb:mitre": {
+        "owner_repo": "shared",
+        "read_agents": [
+            "SecurityAnalystAgent",
+            "ThreatModelingAgent",
+            "RedTeamAdversaryAgent",
+            "ComplianceGovernanceAgent",
+        ],
+        "write_agents": [],
+    },
+    "kb:nist_controls": {
+        "owner_repo": "shared",
+        "read_agents": ["ThreatModelingAgent", "ComplianceGovernanceAgent"],
+        "write_agents": [],
+    },
+    "kb:nist_ai_rmf": {
+        "owner_repo": "shared",
+        "read_agents": ["ComplianceGovernanceAgent"],
+        "write_agents": [],
+    },
+    "kb:soc2_criteria": {
+        "owner_repo": "shared",
+        "read_agents": ["ComplianceGovernanceAgent"],
+        "write_agents": [],
+    },
+    # kb:asset_inventory is owned by marketplace-tracking-backend; this repo
+    # treats it as a read-only external knowledge base for the TM agent.
+    "kb:asset_inventory": {
+        "owner_repo": "marketplace-tracking-backend",
+        "read_agents": ["ThreatModelingAgent"],
+        "write_agents": [],
+    },
+    "kb:threat_intel": {
+        "owner_repo": "shared",
+        "read_agents": ["SecurityAnalystAgent"],
+        "write_agents": [],
+    },
+    # audit:decisions is owned by gh0st-lay3r; ComplianceGovernanceAgent may
+    # append entries but can never modify or delete prior records.
+    "audit:decisions": {
+        "owner_repo": "gh0st-lay3r",
+        "read_agents": ["ComplianceGovernanceAgent"],
+        "write_agents": ["ComplianceGovernanceAgent"],
+        "append_only": True,
+    },
+}
+
+# Maps each ToolCategory to the access level each downstream repo may exercise.
+# Access levels: "none" | "read" | "write" | "source"
+CROSS_REPO_PERMISSIONS: dict[str, dict[str, str]] = {
+    ToolCategory.SIEM_READ.value: {
+        "intake-agent-v2":              "source",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "read",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.CVE_LOOKUP.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "read",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.MITRE_ATT_CK.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "read",
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.THREAT_INTEL.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "read",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.COMPLIANCE_DB.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "read",
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "read",
+    },
+    ToolCategory.RAG_RETRIEVAL.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "read",
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.REPORT_WRITE.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "write",
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "read",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.POLICY_GATE.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "write",  # ComplianceGovernanceAgent only
+        "ttx-operator-shell":           "read",
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.SIMULATION_EXEC.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "write",  # RedTeamAdversaryAgent, sandboxed
+        "ttx-operator-shell":           "read",
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "none",
+    },
+    ToolCategory.ALERT_DISPATCH.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "write",  # ComplianceGovernanceAgent only
+        "ttx-operator-shell":           "write",  # human-approved dispatch
+        "marketplace-tracking-backend": "none",
+        "gh0st-lay3r":                  "none",
+    },
+    # safe_telemetry_log — Aurelius writes audit-safe telemetry events and invokes
+    # validate_prompt_agent_linkage() as a governance health-check tool.
+    # marketplace-tracking-backend reads for telemetry aggregation only.
+    ToolCategory.SAFE_TELEMETRY_LOG.value: {
+        "intake-agent-v2":              "none",
+        "ai-security-framework":        "write",  # AureliusAgent: safeTelemetryLog + linkage check
+        "ttx-operator-shell":           "none",
+        "marketplace-tracking-backend": "read",
+        "gh0st-lay3r":                  "none",
+    },
+}
+
+
+def validate_agent_namespace_access(
+    agent_name: str,
+    namespace: str,
+    access_type: str = "read",
+) -> bool:
+    """
+    Return True if agent_name is permitted to access namespace at access_type level.
+
+    Unknown namespaces are denied by default (fail-closed).
+    """
+    ns = MEMORY_NAMESPACE_MAP.get(namespace)
+    if ns is None:
+        return False
+    if access_type == "write":
+        return agent_name in ns.get("write_agents", [])
+    return agent_name in ns.get("read_agents", [])
+
+
+def validate_cross_repo_tool_access(tool: ToolCategory, repo: str) -> str:
+    """Return the access level repo has for tool. Defaults to 'none'."""
+    return CROSS_REPO_PERMISSIONS.get(tool.value, {}).get(repo, "none")
+
+
+@dataclass
+class SecurityRunContext:
+    """
+    Cross-repo correlation carrier for a single pipeline run.
+    Serialised as the X-Security-Run-ID HTTP header between services.
+    Not used for audit hardening (HMAC/sealing) — that belongs to a later branch.
+    """
+    pipeline_run_id: str
+    trust_floor: TrustLevel = TrustLevel.LOW
+    initiated_by_repo: str = "ai-security-framework"
+
+    def as_header_value(self) -> str:
+        """Encode as a URL-safe base64 token for the X-Security-Run-ID header."""
+        import base64
+        import json
+        payload = {
+            "run_id": self.pipeline_run_id,
+            "trust_floor": self.trust_floor.name,
+            "repo": self.initiated_by_repo,
+        }
+        return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+    @classmethod
+    def from_header_value(cls, header: str) -> "SecurityRunContext":
+        """Decode an X-Security-Run-ID header value back into a context object."""
+        import base64
+        import json
+        payload = json.loads(base64.urlsafe_b64decode(header.encode()))
+        return cls(
+            pipeline_run_id=payload["run_id"],
+            trust_floor=TrustLevel[payload["trust_floor"]],
+            initiated_by_repo=payload["repo"],
+        )
