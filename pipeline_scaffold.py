@@ -130,6 +130,103 @@ class PipelineResult:
     error: Optional[dict[str, Any]] = None
 
 
+# Terminal statuses that may emit approved actionable security payloads.
+_PAYLOAD_RELEASE_STATUSES = frozenset({PipelineStatus.COMPLETED})
+
+
+class HumanReviewControlError(Exception):
+    """
+    Explicit control-boundary failure for human-review gates.
+
+    Raised (or used as a typed signal) when HITL approval is unavailable,
+    declined, or otherwise cannot authorize release of actionable outputs.
+    Must never fall through to a response that still contains actionable payloads.
+    """
+
+    def __init__(self, reason: str, *, status: PipelineStatus = PipelineStatus.NEEDS_REVIEW) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.status = status
+
+
+def _withhold_actionable_outputs(result: PipelineResult) -> None:
+    """Clear actionable / dispatchable fields from a pipeline result in place."""
+    result.analyst_output = None
+    result.threat_model_output = None
+    result.red_team_output = None
+    result.evaluation_summary = None
+
+
+def sanitize_result_for_status(result: PipelineResult) -> PipelineResult:
+    """
+    Authoritative release policy for terminal pipeline results.
+
+    COMPLETED → approved payloads may be emitted.
+    NEEDS_REVIEW / BLOCKED → metadata + review reason only; no actionable payloads.
+    FAILED (and other non-release statuses) → diagnostic metadata only.
+
+    Returns a shallow-copied public view; does not rely on callers having
+    already mutated the internal result object.
+    """
+    public = PipelineResult(
+        pipeline_run_id=result.pipeline_run_id,
+        status=result.status,
+        analyst_output=result.analyst_output,
+        threat_model_output=result.threat_model_output,
+        red_team_output=result.red_team_output,
+        compliance_output=result.compliance_output,
+        evaluation_summary=result.evaluation_summary,
+        audit_log=list(result.audit_log),
+        completed_at_utc=result.completed_at_utc,
+        error=dict(result.error) if result.error else None,
+    )
+
+    if public.status not in _PAYLOAD_RELEASE_STATUSES:
+        _withhold_actionable_outputs(public)
+        # Compliance decisions may cite remediation guidance; keep only non-actionable gate metadata.
+        if public.compliance_output is not None and public.status in {
+            PipelineStatus.NEEDS_REVIEW,
+            PipelineStatus.BLOCKED,
+            PipelineStatus.FAILED,
+        }:
+            decision = public.compliance_output.payload.get("decision")
+            public.compliance_output = AgentOutput(
+                agent_name=public.compliance_output.agent_name,
+                schema=public.compliance_output.schema,
+                payload={
+                    "schema": public.compliance_output.payload.get("schema"),
+                    "decision": decision,
+                    "decision_id": public.compliance_output.payload.get("decision_id"),
+                    "reviewed_agent": public.compliance_output.payload.get("reviewed_agent"),
+                },
+                retrieval_confidence=public.compliance_output.retrieval_confidence,
+                compliance_decision=public.compliance_output.compliance_decision,
+                pipeline_run_id=public.compliance_output.pipeline_run_id,
+                produced_at_utc=public.compliance_output.produced_at_utc,
+                flags=[],
+            )
+
+    return public
+
+
+def public_result_view(result: PipelineResult) -> PipelineResult:
+    """Alias for sanitize_result_for_status — every transport path should use this."""
+    return sanitize_result_for_status(result)
+
+
+def serialize_pipeline_result(result: PipelineResult) -> dict[str, Any]:
+    """
+    Serialize a pipeline result for CLI/API transport under the release policy.
+
+    Always applies public_result_view so blocked/failed/needs-review results
+    cannot emit analyst/TM/red-team payloads even if an internal object retains them.
+    """
+    public = public_result_view(result)
+    payload = asdict(public)
+    payload["status"] = public.status.name
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # RAG Grounding Pipeline
 # ---------------------------------------------------------------------------
@@ -681,6 +778,11 @@ def human_review_checkpoint(
     In production, this dispatches a review request to a ticketing system
     or SOC dashboard and blocks until approval is received.
 
+    Until a real HITL dispatcher exists, this fails closed by raising
+    NotImplementedError with reason human_review_unavailable. Callers must
+    treat that as a control-boundary failure (NEEDS_REVIEW), never as a
+    generic runtime error that still releases actionable payloads.
+
     Args:
         output:               The agent output requiring review.
         pipeline_run_id:      Current pipeline run identifier.
@@ -688,6 +790,9 @@ def human_review_checkpoint(
 
     Returns:
         True if approved, False if rejected.
+
+    Raises:
+        NotImplementedError: When production HITL dispatch is unavailable.
     """
     if auto_approve_in_test:
         logger.warning(
@@ -706,10 +811,8 @@ def human_review_checkpoint(
     # approved = wait_for_approval(approval_token, timeout_seconds=3600)
     # return approved
 
-    raise NotImplementedError(
-        "Human review dispatch must be implemented for production use. "
-        "Integrate with your SOC ticketing system here."
-    )
+    # Fail closed until real HITL dispatch exists — do not release pre-review payloads.
+    raise NotImplementedError("human_review_unavailable")
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +931,10 @@ def run_pipeline(
     )
     run_id = pipeline_input.pipeline_run_id
     result = PipelineResult(pipeline_run_id=run_id, status=PipelineStatus.RUNNING)
+    # Pre-review staging: hold actionable outputs privately until the release gate passes.
+    staged_analyst: Optional[AgentOutput] = None
+    staged_threat_model: Optional[AgentOutput] = None
+    staged_red_team: Optional[AgentOutput] = None
 
     audit.log_event(
         event_type="PIPELINE_START",
@@ -850,14 +957,20 @@ def run_pipeline(
         audit.log_event("AGENT_OUTPUT", run_id, "SecurityAnalystAgent", "analyst", {"eval": analyst_eval})
 
         if not analyst_eval["passed"]:
-            return _fail_pipeline(result, "Security Analyst output failed evaluation rubric.", audit, run_id)
+            return public_result_view(
+                _fail_pipeline(result, "Security Analyst output failed evaluation rubric.", audit, run_id)
+            )
 
         analyst_compliance = invoke_compliance_governance(analyst_output, llm_client)
-        result.analyst_output = analyst_output
+        staged_analyst = analyst_output
         result.compliance_output = analyst_compliance
 
         if analyst_compliance.payload["decision"] == "BLOCKED":
-            return _block_pipeline(result, analyst_compliance, audit, run_id)
+            # Attach only for internal audit path; public view withholds actionable payloads.
+            result.analyst_output = staged_analyst
+            return public_result_view(
+                _block_pipeline(result, analyst_compliance, audit, run_id)
+            )
 
         # ── Stage 4: Threat Modeling (Conditional) ─────────────────────────
         escalate = analyst_output.payload.get("escalate_to_threat_modeling", False)
@@ -868,34 +981,62 @@ def run_pipeline(
             audit.log_event("AGENT_OUTPUT", run_id, "ThreatModelingAgent", "threat_modeling", {"eval": tm_eval})
 
             if not tm_eval["passed"]:
-                return _fail_pipeline(result, "Threat Modeling output failed evaluation rubric.", audit, run_id)
+                return public_result_view(
+                    _fail_pipeline(result, "Threat Modeling output failed evaluation rubric.", audit, run_id)
+                )
 
             tm_compliance = invoke_compliance_governance(tm_output, llm_client)
-            result.threat_model_output = tm_output
+            staged_threat_model = tm_output
 
             if tm_compliance.payload["decision"] == "BLOCKED":
-                return _block_pipeline(result, tm_compliance, audit, run_id)
+                result.analyst_output = staged_analyst
+                result.threat_model_output = staged_threat_model
+                return public_result_view(
+                    _block_pipeline(result, tm_compliance, audit, run_id)
+                )
 
             # ── Stage 5: Red Team Adversary (Optional) ─────────────────────
             if enable_red_team:
                 rag_context_rt = _ground_input(pipeline_input, rag_pipeline, audit, run_id, stage="red_team")
                 rt_output = invoke_red_team_adversary(tm_output, rag_context_rt, llm_client)
 
-                # Red team outputs ALWAYS require human-in-the-loop review
-                approved = human_review_checkpoint(
-                    rt_output, run_id, auto_approve_in_test=auto_approve_human_review
-                )
+                # Red team outputs ALWAYS require human-in-the-loop review.
+                # Catch NotImplementedError separately from generic exceptions —
+                # missing HITL dispatch is a control failure, not an ordinary runtime error.
+                try:
+                    approved = human_review_checkpoint(
+                        rt_output, run_id, auto_approve_in_test=auto_approve_human_review
+                    )
+                except NotImplementedError as hitl_exc:
+                    raise HumanReviewControlError(
+                        str(hitl_exc) or "human_review_unavailable",
+                        status=PipelineStatus.NEEDS_REVIEW,
+                    ) from hitl_exc
+
                 if not approved:
-                    return _block_pipeline(result, None, audit, run_id, reason="Human reviewer rejected red-team output.")
+                    raise HumanReviewControlError(
+                        "human_review_rejected",
+                        status=PipelineStatus.BLOCKED,
+                    )
 
                 rt_eval = rubric.evaluate(rt_output)
                 audit.log_event("AGENT_OUTPUT", run_id, "RedTeamAdversaryAgent", "red_team", {"eval": rt_eval})
 
                 rt_compliance = invoke_compliance_governance(rt_output, llm_client)
-                result.red_team_output = rt_output
+                staged_red_team = rt_output
 
                 if rt_compliance.payload["decision"] == "BLOCKED":
-                    return _block_pipeline(result, rt_compliance, audit, run_id)
+                    result.analyst_output = staged_analyst
+                    result.threat_model_output = staged_threat_model
+                    result.red_team_output = staged_red_team
+                    return public_result_view(
+                        _block_pipeline(result, rt_compliance, audit, run_id)
+                    )
+
+        # Release gate passed — attach staged actionable outputs only now.
+        result.analyst_output = staged_analyst
+        result.threat_model_output = staged_threat_model
+        result.red_team_output = staged_red_team
 
         # ── Stage 6: Final Evaluation Summary ─────────────────────────────
         result.evaluation_summary = _build_evaluation_summary(result, rubric)
@@ -906,13 +1047,42 @@ def run_pipeline(
         result.audit_log = audit.get_full_audit_trail()
 
         audit.log_event("PIPELINE_COMPLETE", run_id, None, "complete", {"status": "COMPLETED"})
-        return result
+        return public_result_view(result)
+
+    except HumanReviewControlError as control_exc:
+        logger.warning(
+            "Human-review control boundary failure — failing closed",
+            extra={
+                "pipeline_run_id": run_id,
+                "agent": None,
+                "stage": "human_review",
+            },
+        )
+        # Do not attach staged pre-review payloads on control failure.
+        _withhold_actionable_outputs(result)
+        result.status = control_exc.status
+        result.error = {
+            "reason": control_exc.reason,
+            "blocked_by": "human_review_checkpoint",
+            "pipeline_run_id": run_id,
+        }
+        result.audit_log = audit.get_full_audit_trail()
+        audit.log_event(
+            "PIPELINE_NEEDS_REVIEW" if control_exc.status == PipelineStatus.NEEDS_REVIEW else "PIPELINE_BLOCKED",
+            run_id,
+            None,
+            "human_review",
+            {"reason": control_exc.reason, "status": control_exc.status.name},
+        )
+        return public_result_view(result)
 
     except Exception as exc:  # pylint: disable=broad-except
         logger.exception(
             "Unhandled pipeline exception",
             extra={"pipeline_run_id": run_id, "agent": None, "stage": "exception"},
         )
+        # Fail closed: never resurrect prior-stage actionable outputs on generic failure.
+        _withhold_actionable_outputs(result)
         result.status = PipelineStatus.FAILED
         result.error = {
             "exception_type": type(exc).__name__,
@@ -921,7 +1091,7 @@ def run_pipeline(
         }
         result.audit_log = audit.get_full_audit_trail()
         audit.log_event("PIPELINE_ERROR", run_id, None, "exception", {"error": str(exc)})
-        return result
+        return public_result_view(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1004,8 +1174,9 @@ def _fail_pipeline(
     audit: AuditLogger,
     run_id: str,
 ) -> PipelineResult:
-    """Mark pipeline as failed and log the failure reason."""
+    """Mark pipeline as failed, withhold actionable payloads, and log the failure reason."""
     result.status = PipelineStatus.FAILED
+    _withhold_actionable_outputs(result)
     result.error = {"reason": reason}
     result.audit_log = audit.get_full_audit_trail()
     audit.log_event("PIPELINE_FAILED", run_id, None, "failure", {"reason": reason})
@@ -1019,15 +1190,25 @@ def _block_pipeline(
     run_id: str,
     reason: Optional[str] = None,
 ) -> PipelineResult:
-    """Mark pipeline as blocked by Compliance Agent veto."""
+    """Mark pipeline as blocked and withhold actionable security payloads."""
     result.status = PipelineStatus.BLOCKED
+    _withhold_actionable_outputs(result)
     block_reason = reason or (
         compliance_output.payload.get("remediation_guidance", "Compliance gate blocked output.")
         if compliance_output else "Compliance gate blocked output."
     )
-    result.error = {"reason": block_reason, "blocked_by": "ComplianceGovernanceAgent"}
+    result.error = {
+        "reason": block_reason,
+        "blocked_by": "ComplianceGovernanceAgent" if compliance_output else "human_review_checkpoint",
+    }
     result.audit_log = audit.get_full_audit_trail()
-    audit.log_event("PIPELINE_BLOCKED", run_id, "ComplianceGovernanceAgent", "compliance_gate", {"reason": block_reason})
+    audit.log_event(
+        "PIPELINE_BLOCKED",
+        run_id,
+        "ComplianceGovernanceAgent" if compliance_output else None,
+        "compliance_gate" if compliance_output else "human_review",
+        {"reason": block_reason},
+    )
     return result
 
 
@@ -1081,15 +1262,21 @@ if __name__ == "__main__":
             "severity_raw": "HIGH",
         }
 
+    # Production default: never auto-approve HITL. Tests may pass True explicitly.
+    auto_approve = os.environ.get("MSH_AUTO_APPROVE_HUMAN_REVIEW", "").lower() in {
+        "1", "true", "yes",
+    }
+
     pipeline_result = run_pipeline(
         raw_input=raw,
         input_type="siem_alert",
         source_system="splunk_es",
         llm_client=None,       # Inject real LLM client here
         enable_red_team=(args.mode == "redteam"),
-        auto_approve_human_review=True,   # Set False in production
+        auto_approve_human_review=auto_approve,
         audit_sink=args.sink,
     )
 
-    print(json.dumps(asdict(pipeline_result), indent=2, default=str))
+    # Transport path applies the same release policy as the returned object.
+    print(json.dumps(serialize_pipeline_result(pipeline_result), indent=2, default=str))
     sys.exit(0 if pipeline_result.status == PipelineStatus.COMPLETED else 1)
