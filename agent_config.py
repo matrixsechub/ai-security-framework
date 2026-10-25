@@ -365,3 +365,4 @@ def _derive_system_message(config: AgentConfig) -> str:
         f"Active safety guardrails:\n{guardrail_list}\n\n"
         f"Produce all outputs in '{config.output_schema}' format. "
         f"Do not exceed {config.max_iterations} reasoning steps per task."
+    )
